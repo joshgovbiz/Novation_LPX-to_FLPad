@@ -1,4 +1,4 @@
-# name=Launchpad X - FLpad Layout
+# name=Launchpad X - FLpad Layout v11
 # FL Studio MIDI script that gives a Novation Launchpad X an FLpad-style workflow.
 # Built from the FLpad user guide v1.0 and the Launchpad X Programmer's Reference.
 #
@@ -7,8 +7,10 @@
 #
 # Layout (Programmer mode):  pads = notes 11-88, round buttons = CC.
 #
-#  TOP ROW (CC 91-98):   91 Page <   92 Page >   93 CR up   94 CR down
-#                        95 Sequencer 4x/2x/1x   96 Note   97 SHIFT (hold)   98 unused
+#  TOP ROW (CC 91-98), same order as the FLpad:
+#                        91 (arrow up) Page >    92 (arrow down) Page <
+#                        93 (arrow left) Channel Rack up    94 (arrow right) Channel Rack down
+#                        95 Sequencer 4x/2x/1x   96 Note   97 Custom Modes (unused)   98 SHIFT (hold)
 #  RIGHT COLUMN (top to bottom, CC 89..19):
 #                        89 Patterns   79 Channel Rack   69 Channel Mixer   59 Graph Edit
 #                        49 Clear (hold)   39 Undo   29 Play   19 Record
@@ -38,7 +40,22 @@ WHITE = (127, 127, 127)
 STEP_MAX = 512
 DRUM_BASE = 36                 # first note of the drum (FPC-style) layout; bank B = +16
 GRAPH_EDIT_ENABLED = True      # Velocity editing only; set False if it misbehaves
-P_VELOCITY = getattr(midi, "pVelocity", 2)
+P_VELOCITY = getattr(midi, "pVelocity", 1)   # FL step params: 0 pitch, 1 velocity, 2 release
+
+# Sequencer look and feel (as in the FLpad guide): every channel is drawn in its own FL colour.
+# A step with a note is that colour at full brightness; an empty step is a paler tint at STEP_OFF_LEVEL.
+STEP_OFF_WHITEN = 0.0          # 0 = empty steps are the pure (dimmed) channel colour, 1 = pure white
+STEP_SAT_MIN = 0.9             # minimum saturation of step colours: 1 = pure hue, lower = more pastel
+LED_GAMMA = 2.0                # FL colours are gamma-encoded, LEDs are linear; lower = brighter mid-tones
+LED_BRIGHTNESS = 127           # Launchpad brightness 0-127, sent on start-up (None = leave the device setting alone)
+SWAP_RED_BLUE = False          # set True if red and blue look swapped on the pads
+DEBUG_COLORS = True            # print each channel's raw FL colour and LED values when they change
+STEP_OFF_LEVEL = 0.2           # steps are 100% lit when on, 20% lit when off
+PLAYHEAD = (127, 127, 127)     # white, as on the FLpad
+SEQ_NOTE = 60                  # C5: every sequencer pad auditions this pitch
+SEQ_VELOCITY = 100             # fixed, ignores how hard the pad is hit
+SEQ_LAYOUT_COLORS = {4: (0, 127, 60), 2: (127, 110, 0), 1: (127, 30, 100)}   # 4x green, 2x yellow, 1x pink
+DEBUG_MIDI = True              # print each button/pad message to Script output (set False when done)
 
 SCALES = [
     ("Minor", [0, 2, 3, 5, 7, 8, 10]),
@@ -89,9 +106,15 @@ def scale_rgb(c, k):
     return (int(c[0] * k), int(c[1] * k), int(c[2] * k))
 
 
+def fl_rgb(color):
+    """FL colour int -> (r, g, b), 0-255, using FL's own utils.ColorToRGB."""
+    r, g, b = utils.ColorToRGB(color)
+    return (b, g, r) if SWAP_RED_BLUE else (r, g, b)
+
+
 def rgb7(color):
     try:
-        r, g, b = utils.ColorToRGB(color)
+        r, g, b = fl_rgb(color)
         return (max(r >> 1, 6), max(g >> 1, 6), max(b >> 1, 6))
     except Exception:
         return (40, 40, 127)
@@ -161,6 +184,36 @@ def clear_channel(ch):
             channels.setGridBit(ch, s, 0)
 
 
+def pattern_in_use(n):
+    """True if pattern slot n holds a pattern. FL does not guarantee used patterns are adjacent."""
+    try:
+        return not patterns.isPatternDefault(n)
+    except Exception:
+        return n <= patterns.patternCount()      # older FL builds: assume they are adjacent
+
+
+def show_graph_editor():
+    """Open FL's graph editor on the Velocity lane for the selected channel."""
+    step = min(ge_sel) if ge_sel else 0
+    ch = sel_channel()
+    try:
+        channels.showGraphEditor(False, P_VELOCITY, step, ch, False)
+    except TypeError:
+        try:                                    # older FL builds without useGlobalIndex
+            channels.showGraphEditor(False, P_VELOCITY, step, ch)
+        except Exception as e:
+            print("Graph Edit: could not open FL's graph editor:", e)
+    except Exception as e:
+        print("Graph Edit: could not open FL's graph editor:", e)
+
+
+def hide_graph_editor():
+    try:
+        channels.closeGraphEditor(sel_channel())   # undocumented in the API reference
+    except Exception:
+        pass
+
+
 def note_at(rr, c0):
     """Note for the bottom-half layouts. rr = 0 (bottom row) .. 3, c0 = 0..7."""
     if note_layout == 0:                                  # chromatic, two octaves
@@ -188,22 +241,54 @@ def note_color(rr, c0):
 
 
 # ------------------------------------------------------------------ drawing
+def vivid(r, g, b):
+    """Full-brightness version of a colour with saturation raised to at least STEP_SAT_MIN, hue kept.
+    Returns floats 0-1. Greys stay uncoloured (white)."""
+    top, low = max(r, g, b), min(r, g, b)
+    if top == 0:
+        return (1.0, 1.0, 1.0)
+    sat = (top - low) / float(top)
+    if sat < 0.1:
+        return (1.0, 1.0, 1.0)
+    sat = max(sat, STEP_SAT_MIN)
+    return tuple((1.0 - sat) + sat * ((c - low) / float(top - low)) for c in (r, g, b))
+
+
+last_colors = {}        # channel -> last raw FL colour logged (DEBUG_COLORS)
+
+
+def step_colors(ch):
+    """(lit, empty) LED colours for a channel, derived ad hoc from its current FL colour."""
+    raw = None
+    try:
+        raw = channels.getChannelColor(ch)
+        r, g, b = fl_rgb(raw)
+    except Exception:
+        r, g, b = 100, 100, 255
+    # full brightness, saturation raised, hue kept; gamma then darkens the weak components for a deep look
+    lit = tuple(round(127 * (c ** LED_GAMMA)) for c in vivid(r, g, b))
+    pale = tuple(int(c + (127 - c) * STEP_OFF_WHITEN) for c in lit)
+    empty = scale_rgb(pale, STEP_OFF_LEVEL)
+    if DEBUG_COLORS and last_colors.get(ch) != raw:
+        last_colors[ch] = raw
+        print("Channel", ch, "colour: raw", hex(raw) if raw is not None else None,
+              "-> RGB", (r, g, b), "-> LED lit", lit, "empty", empty)
+    return lit, empty
+
+
 def draw_steps(f, r_top, nrows, ch, first):
     if ch >= n_channels():
         return
-    col = ch_color(ch)
+    lit, empty = step_colors(ch)
     ph = cur_step()
     for r in range(nrows):
         for c in range(8):
             step = first + r * 8 + c
             if step >= STEP_MAX:
                 continue
-            if channels.getGridBit(ch, step):
-                c_out = col
-            else:
-                c_out = scale_rgb(col, 0.16 if (c // 4) % 2 == 0 else 0.07)
+            c_out = lit if channels.getGridBit(ch, step) else empty
             if step == ph:
-                c_out = WHITE
+                c_out = PLAYHEAD
             f[led_index(r_top + r, c)] = c_out
 
 
@@ -254,13 +339,12 @@ def draw_view(f):
             if c0 < len(SCALES):
                 f[led_index(6, c0)] = WHITE if c0 == scale_idx else (127, 55, 0)
     elif v == "patterns":
-        cnt = patterns.patternCount()
         act = patterns.patternNumber()
         for i in range(64):
             n = i + 1
             if n == act:
                 c = WHITE
-            elif n <= cnt:
+            elif pattern_in_use(n):
                 try:
                     c = rgb7(patterns.getPatternColor(n))
                 except Exception:
@@ -321,14 +405,14 @@ def draw_buttons(f):
     else:
         size = 32
         page = page32
-    f[91] = (60, 60, 60) if page > 0 else (8, 8, 8)
-    f[92] = (60, 60, 60) if (page + 1) * size < STEP_MAX else (8, 8, 8)
+    f[91] = (60, 60, 60) if (page + 1) * size < STEP_MAX else (8, 8, 8)   # Page >
+    f[92] = (60, 60, 60) if page > 0 else (8, 8, 8)                       # Page <
     f[93] = (60, 40, 0)
     f[94] = (60, 40, 0)
-    f[95] = (0, 127, 60) if view == "seq" else (0, 20, 10)
+    f[95] = SEQ_LAYOUT_COLORS[seq_layout] if view == "seq" else (0, 20, 10)
     f[96] = (0, 110, 127) if view in ("note", "scale") else (0, 18, 25)
-    f[97] = WHITE if shift else (30, 30, 30)
-    f[98] = OFF
+    f[97] = (12, 12, 12)                          # Custom Modes (not implemented)
+    f[98] = WHITE if shift else (30, 30, 30)      # Shift
     f[89] = (127, 80, 0) if view == "patterns" else (25, 15, 0)
     f[79] = (127, 40, 100) if view in ("crack", "mutes") else (25, 8, 20)
     f[69] = (0, 100, 127) if view in ("mixer", "pan") else (0, 20, 25)
@@ -353,6 +437,8 @@ def draw():
 # ------------------------------------------------------------------ input: buttons
 def set_view(v):
     global view, crack_temp
+    if view == "graph" and v != "graph":
+        hide_graph_editor()
     view = v
     crack_temp = False
     ge_sel.clear()
@@ -377,6 +463,8 @@ def scroll(d):
     if view in ("note", "graph"):
         channels.selectOneChannel(max(0, min(count - 1, sel_channel() + d)))
         ge_sel.clear()
+        if view == "graph":
+            show_graph_editor()
         return
     step = seq_layout if view == "seq" else 8
     chan_off = max(0, min(chan_off + d * step, max(0, count - 1)))
@@ -411,8 +499,10 @@ def do_undo(redo):
 def on_button(cc, val):
     global shift, clear_held, seq_layout, seq_page, note_layout
     down = val > 0
-    if cc == 97:
+    if cc == 98:
         shift = down
+        return
+    if cc == 97:          # Custom Modes: not implemented
         return
     if cc == 49:
         clear_held = down
@@ -423,17 +513,18 @@ def on_button(cc, val):
     if not down:
         return
     if cc == 91:
-        page_move(-1)
+        page_move(1)          # arrow up    = Page >
     elif cc == 92:
-        page_move(1)
+        page_move(-1)         # arrow down  = Page <
     elif cc == 93:
-        scroll(-1)
+        scroll(-1)            # arrow left  = Channel Rack up
     elif cc == 94:
-        scroll(1)
+        scroll(1)             # arrow right = Channel Rack down
     elif cc == 95:
         if view == "seq":
             seq_layout = {4: 2, 2: 1, 1: 4}[seq_layout]
             seq_page = 0
+            print("Sequencer layout:", str(seq_layout) + "x")
         else:
             set_view("seq")
     elif cc == 96:
@@ -450,6 +541,7 @@ def on_button(cc, val):
     elif cc == 59:
         if GRAPH_EDIT_ENABLED:
             set_view("graph")
+            show_graph_editor()
     elif cc == 39:
         do_undo(shift)
     elif cc == 29:
@@ -482,6 +574,7 @@ def on_pad(n, vel, on):
         if ch < n_channels():
             channels.selectOneChannel(ch)
             toggle_step(ch, seq_page * rpc * 8 + (r0 % rpc) * 8 + c0)
+            trigger(n, ch, SEQ_NOTE, SEQ_VELOCITY)
 
     elif v in ("crack", "mutes", "note"):
         if r0 < 4:
@@ -539,17 +632,29 @@ def on_pad(n, vel, on):
         elif r0 in (5, 6):
             val = 7 + 8 * ((r0 - 5) * 8 + c0)        # 7 .. 127, as in the FLpad guide
             pat = patterns.patternNumber()
+            if not ge_sel:
+                print("Graph Edit: no steps selected - tap lit steps in the top 4 rows first")
             for s in ge_sel:
                 try:
                     channels.setStepParameterByIndex(sel, pat, s, P_VELOCITY, val)
+                    now = channels.getCurrentStepParam(sel, s, P_VELOCITY)
+                    print("Graph Edit: ch", sel, "pattern", pat, "step", s,
+                          "velocity set to", val, "- FL reads back", now)
                 except Exception as e:
                     print("Graph Edit velocity failed:", e)
                     break
+            try:
+                channels.updateGraphEditor()      # undocumented, but refreshes FL's graph editor
+            except Exception:
+                pass
 
 
 # ------------------------------------------------------------------ FL Studio callbacks
 def OnInit():
+    print("Launchpad X - FLpad Layout v11 loaded")   # keep in step with the # name= line
     sysex(HDR + [0x0E, 0x01, 0xF7])        # Programmer mode
+    if LED_BRIGHTNESS is not None:
+        sysex(HDR + [0x08, LED_BRIGHTNESS, 0xF7])
     last_frame.clear()
     draw()
 
@@ -560,8 +665,14 @@ def OnDeInit():
     sysex(HDR + [0x0E, 0x00, 0xF7])        # back to Live mode
 
 
-def OnMidiMsg(event):
+last_evt = (None, 0.0)      # (status, data1, data2) of the last event OnMidiIn consumed, and when
+
+
+def process(event):
+    """Handle one Launchpad event. Returns True if the event was ours."""
     s = event.status & 0xF0
+    if DEBUG_MIDI and s in (0x90, 0x80, 0xB0):
+        print("Launchpad in: status", hex(event.status), "data1", event.data1, "data2", event.data2)
     if s == 0xB0:
         event.handled = True
         on_button(event.data1, event.data2)
@@ -570,10 +681,28 @@ def OnMidiMsg(event):
         on_pad(event.data1, event.data2, s == 0x90 and event.data2 > 0)
     elif s in (0xA0, 0xD0):                # swallow aftertouch
         event.handled = True
-        return
+        return True
     else:
-        return
+        return False
     draw()
+    return True
+
+
+def OnMidiIn(event):
+    # Runs BEFORE FL Studio routes the event, so marking it handled here stops FL
+    # playing the raw pad note (pitch = pad number, velocity = how hard you hit).
+    global last_evt
+    if process(event):
+        last_evt = ((event.status, event.data1, event.data2), time.time())
+
+
+def OnMidiMsg(event):
+    # Fallback in case FL still delivers an event OnMidiIn already consumed.
+    key, t = last_evt
+    if key == (event.status, event.data1, event.data2) and time.time() - t < 0.05:
+        event.handled = True
+        return
+    process(event)
 
 
 def OnRefresh(flags):
